@@ -1,5 +1,10 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Active handoff — davinci WLAN diagnostic (2026-10-26)
+- Added source patch `xnu/patches/0084-davinci-icnss-diagnostic.patch`. It reads only Apple Device Tree registry properties from `SweetPlatformExpert::processTopLevel`; it does not map registers or touch power, DMA, IOMMU, firmware, or interrupt hardware.
+- Confirmed limitation: current `tools/mkadt.py` does not include `/soc/qcom,icnss@18800000`, `/reserved-memory/wlan_msa_region@97d00000`, or WLAN SMP2P nodes. The current generated ADT will therefore log that ICNSS is absent. No fabricated nodes were added.
+- Validation so far: patch parses and applies against a temporary reconstruction of `SweetPlatformExpert.cpp` from patch 0016 plus the platform-expert hunk from patch 0046. No XNU compile, CI run, device boot, or boot-image change has been done. Push of commit `e771977` to configured `Antcating/ios-davinci` remote was rejected with HTTP 403 (`Permission denied to ridhamythm`), so no Actions run ID exists. Next: build from an authorized remote/checkout; only a later ADT-enrichment milestone can make the target resources available at runtime.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

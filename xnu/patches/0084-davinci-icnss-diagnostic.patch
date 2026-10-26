@@ -1,0 +1,216 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <libkern/c++/OSData.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -25,4 +26,193 @@
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * Diagnostic-only inspection of the davinci WLAN description in the ADT.
++ * This deliberately reads registry properties only: it does not map or
++ * access device registers, power resources, DMA, IOMMU or interrupts.
++ */
++static uint32_t
++davinci_wlan_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint64_t
++davinci_wlan_le64(const uint8_t *p)
++{
++	return (uint64_t)davinci_wlan_le32(p) |
++	    ((uint64_t)davinci_wlan_le32(p + 4) << 32);
++}
++
++static void
++davinci_wlan_cells(IORegistryEntry *entry, const char *key,
++    unsigned int tupleCells, unsigned int expectedTuples)
++{
++	OSObject *object = entry->getProperty(key);
++	if (object == NULL) {
++		IOLog("DAVINCI WLAN: %s missing\n", key);
++		return;
++	}
++	OSData *data = OSDynamicCast(OSData, object);
++	if (data == NULL) {
++		IOLog("DAVINCI WLAN: %s malformed (not OSData)\n", key);
++		return;
++	}
++	IOByteCount length = data->getLength();
++	if (length > 2048 || length == 0 || (length & 3) != 0) {
++		IOLog("DAVINCI WLAN: %s malformed length=%llu\n", key,
++		    (unsigned long long)length);
++		return;
++	}
++	const uint8_t *bytes = (const uint8_t *)data->getBytesNoCopy();
++	if (bytes == NULL) {
++		IOLog("DAVINCI WLAN: %s malformed (no data buffer)\n", key);
++		return;
++	}
++	unsigned int cells = (unsigned int)(length / 4);
++	if (tupleCells != 0 && (cells % tupleCells) != 0) {
++		IOLog("DAVINCI WLAN: %s malformed cells=%u tuple=%u\n",
++		    key, cells, tupleCells);
++		return;
++	}
++	if (expectedTuples != 0 && tupleCells != 0 &&
++	    cells / tupleCells != expectedTuples) {
++		IOLog("DAVINCI WLAN: %s unexpected tuple count=%u expected=%u\n",
++		    key, cells / tupleCells, expectedTuples);
++	}
++	IOLog("DAVINCI WLAN: %s cells=%u", key, cells);
++	for (unsigned int i = 0; i < cells; i++) {
++		if (tupleCells != 0 && (i % tupleCells) == 0) {
++			IOLog("\nDAVINCI WLAN:   [%u]", i / tupleCells);
++		}
++		IOLog(" %08x", davinci_wlan_le32(bytes + i * 4));
++	}
++	IOLog("\n");
++}
++
++static void
++davinci_wlan_reg(IORegistryEntry *entry, const char *key,
++    unsigned int expectedRanges)
++{
++	OSObject *object = entry->getProperty(key);
++	if (object == NULL) {
++		IOLog("DAVINCI WLAN: %s missing\n", key);
++		return;
++	}
++	OSData *data = OSDynamicCast(OSData, object);
++	if (data == NULL) {
++		IOLog("DAVINCI WLAN: %s malformed (not OSData)\n", key);
++		return;
++	}
++	IOByteCount length = data->getLength();
++	const uint8_t *bytes = (const uint8_t *)data->getBytesNoCopy();
++	if (bytes == NULL) {
++		IOLog("DAVINCI WLAN: %s malformed (no data buffer)\n", key);
++		return;
++	}
++	if (expectedRanges == 0 || expectedRanges > 4 ||
++	    length != expectedRanges * 16) {
++		IOLog("DAVINCI WLAN: %s malformed length=%llu expected %u ranges\n",
++		    key, (unsigned long long)length, expectedRanges);
++		return;
++	}
++	/* Apple ADT address/size pairs follow mkadt.py's 64-bit encoding. */
++	for (unsigned int i = 0; i < expectedRanges; i++) {
++		IOLog("DAVINCI WLAN: %s[%u] base=%#llx size=%#llx\n", key, i,
++		    (unsigned long long)davinci_wlan_le64(bytes + i * 16),
++		    (unsigned long long)davinci_wlan_le64(bytes + i * 16 + 8));
++	}
++}
++
++static void
++davinci_wlan_strings(IORegistryEntry *entry, const char *key)
++{
++	OSObject *object = entry->getProperty(key);
++	if (object == NULL) {
++		IOLog("DAVINCI WLAN: %s missing\n", key);
++		return;
++	}
++	OSData *data = OSDynamicCast(OSData, object);
++	if (data == NULL || data->getLength() == 0 || data->getLength() > 256) {
++		IOLog("DAVINCI WLAN: %s malformed string data\n", key);
++		return;
++	}
++	const char *bytes = (const char *)data->getBytesNoCopy();
++	IOByteCount length = data->getLength(), start = 0;
++	if (bytes == NULL) {
++		IOLog("DAVINCI WLAN: %s malformed (no data buffer)\n", key);
++		return;
++	}
++	while (start < length) {
++		IOByteCount end = start;
++		while (end < length && bytes[end] != '\0') end++;
++		if (end == length) {
++			IOLog("DAVINCI WLAN: %s malformed unterminated string\n", key);
++			return;
++		}
++		if (end != start) IOLog("DAVINCI WLAN: %s=%s\n", key, bytes + start);
++		start = end + 1;
++	}
++}
++
++static void
++davinci_wlan_diagnostics(IORegistryEntry *root)
++{
++	IORegistryEntry *icnss = root->childFromPath("soc/qcom,icnss@18800000",
++	    gIODTPlane);
++	if (icnss == NULL) {
++		icnss = root->childFromPath("arm-io/qcom,icnss@18800000",
++		    gIODTPlane);
++	}
++	if (icnss == NULL) {
++		IOLog("DAVINCI WLAN: ICNSS node absent from runtime ADT; "
++		    "no hardware probe performed\n");
++		return;
++	}
++
++	IOLog("DAVINCI WLAN: diagnostic-only ICNSS ADT report\n");
++	davinci_wlan_reg(icnss, "reg", 3);
++	davinci_wlan_strings(icnss, "reg-names");
++	davinci_wlan_cells(icnss, "interrupts", 3, 12);
++	davinci_wlan_strings(icnss, "interrupt-names");
++	davinci_wlan_cells(icnss, "iommus", 3, 1);
++	davinci_wlan_cells(icnss, "memory-region", 1, 1);
++	davinci_wlan_cells(icnss, "qcom,wlan-msa-memory", 1, 1);
++	davinci_wlan_cells(icnss, "qcom,wlan-msa-fixed-region", 1, 1);
++	davinci_wlan_cells(icnss, "vdd-cx-mx-supply", 1, 1);
++	davinci_wlan_cells(icnss, "vdd-1.8-xo-supply", 1, 1);
++	davinci_wlan_cells(icnss, "vdd-1.3-rfa-supply", 1, 1);
++	davinci_wlan_cells(icnss, "vdd-3.3-ch0-supply", 1, 1);
++
++	IORegistryEntry *msa = root->childFromPath(
++	    "reserved-memory/wlan_msa_region@97d00000", gIODTPlane);
++	if (msa == NULL) {
++		IOLog("DAVINCI WLAN: reserved-memory WLAN MSA node absent\n");
++	} else {
++		davinci_wlan_reg(msa, "reg", 1);
++		msa->release();
++	}
++
++	IORegistryEntry *smp2p = icnss->childFromPath(
++	    "qcom,smp2p_map_wlan_1_in", gIODTPlane);
++	if (smp2p == NULL) {
++		IOLog("DAVINCI WLAN: ICNSS SMP2P map node absent\n");
++	} else {
++		davinci_wlan_cells(smp2p, "interrupts-extended", 3, 2);
++		davinci_wlan_strings(smp2p, "interrupt-names");
++		smp2p->release();
++	}
++
++	IORegistryEntry *smp2pEntry = root->childFromPath(
++	    "soc/qcom,smp2p-modem/qcom,smp2p-wlan-1-in", gIODTPlane);
++	if (smp2pEntry == NULL) {
++		IOLog("DAVINCI WLAN: shared SMP2P WLAN input entry absent\n");
++	} else {
++		davinci_wlan_cells(smp2pEntry, "AAPL,phandle", 1, 1);
++		smp2pEntry->release();
++	}
++	icnss->release();
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+@@ -74,7 +264,8 @@
+ 		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
+ 		armio->release();
+ 	}
++	davinci_wlan_diagnostics(root);
+ }
+ 
+ bool
+ SweetPlatformExpert::getTargetName(char *name, int maxLength)
+-- 
+2.43.0
