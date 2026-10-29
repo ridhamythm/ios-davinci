@@ -1,0 +1,144 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,2 +114,3 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu_probe.c			standard
++bsd/dev/sweet_gpu_cc.c			standard
+ bsd/dev/mem.c				standard
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_cc.c
+@@ -0,0 +1,125 @@
++/*
++ * SWEET/davinci GPU bring-up, stage 2: READ-ONLY GCC + gpucc state.
++ * Boot-arg sweetgpucc=1. Reads the GCC GPU votes and gcc_gpu_cfg_ahb_clk.
++ * gpucc is touched ONLY if that clock is already on (reading gpucc with it
++ * off can hang the SoC silently). No writes anywhere.
++ * Offsets from Xiaomi davinci-p-oss gcc-sdmmagpie.c / gpucc-sdmmagpie.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_cc_probe(void);
++
++#define GC_GCC_PA        0x00100000u
++#define GC_GCC_LEN       0x00080000u
++#define GC_CC_PA         0x05090000u
++#define GC_CC_LEN        0x00009000u
++
++#define GC_GPLL0_MODE    0x00000u
++#define GC_VOTE0         0x52000u
++#define GC_VOTE1         0x52004u
++#define GC_GPU_CFG_AHB   0x71004u
++#define GC_GPU_MEMNOC    0x7100cu
++
++#define GC_CX_GDSCR      0x106cu
++#define GC_GX_GDSCR      0x100cu
++#define GC_CX_HW_CTRL    0x1540u
++#define GC_GMU_RCG       0x1120u
++#define GC_GFX3D_RCG     0x101cu
++#define GC_PLL0          0x0u
++#define GC_PLL1          0x100u
++
++struct gc_reg {
++	const char *name;
++	uint32_t off;
++};
++
++static const struct gc_reg gc_cbcr[] = {
++	{ "cxo_aon", 0x1004 }, { "gx_gfx3d", 0x1054 }, { "gx_vsense", 0x1058 },
++	{ "gx_cxo", 0x1060 }, { "gx_gmu", 0x1064 }, { "ahb", 0x1078 },
++	{ "crc_ahb", 0x107c }, { "cx_apb", 0x1088 }, { "cx_snoc_dvm", 0x108c },
++	{ "cx_gmu", 0x1098 }, { "cxo", 0x109c }, { "cx_gfx3d", 0x10a4 },
++	{ "cx_gfx3d_slv", 0x10a8 }, { "acd_cxo", 0x1164 }, { "acd_ahb", 0x1168 },
++};
++
++static bool gc_done;
++
++static uint32_t
++gc_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gc_rcg(vm_offset_t cc, const char *name, uint32_t off)
++{
++	uint32_t cmd = gc_rd(cc, off);
++	uint32_t cfg = gc_rd(cc, off + 4u);
++	printf("SWEET GPUCC: rcg %s cmd=%#x cfg=%#x src=%u div=%u root_off=%u\n",
++		name, cmd, cfg, (cfg >> 8) & 7u, cfg & 0x1fu, cmd >> 31);
++}
++
++void
++sweet_gpu_cc_probe(void)
++{
++	uint32_t enabled = 0;
++
++	if (gc_done) {
++		return;
++	}
++	gc_done = true;
++	PE_parse_boot_argn("sweetgpucc", &enabled, sizeof(enabled));
++	if (enabled != 1) {
++		return;
++	}
++
++	vm_offset_t gcc = ml_io_map(GC_GCC_PA, GC_GCC_LEN);
++	if (!gcc) {
++		printf("SWEET GPUCC: gcc map failed\n");
++		return;
++	}
++	uint32_t pll = gc_rd(gcc, GC_GPLL0_MODE);
++	uint32_t v0 = gc_rd(gcc, GC_VOTE0);
++	uint32_t v1 = gc_rd(gcc, GC_VOTE1);
++	uint32_t ahb = gc_rd(gcc, GC_GPU_CFG_AHB);
++	uint32_t mem = gc_rd(gcc, GC_GPU_MEMNOC);
++	printf("SWEET GPUCC: GCC gpll0 mode=%#x vote0=%#x vote1=%#x\n", pll, v0, v1);
++	printf("SWEET GPUCC: GCC gpll0 vote=%u gpu_gpll0=%u gpu_gpll0_div=%u\n",
++		v0 & 1u, (v1 >> 15) & 1u, (v1 >> 16) & 1u);
++	printf("SWEET GPUCC: GCC gpu_cfg_ahb=%#x memnoc_gfx=%#x\n", ahb, mem);
++	if ((ahb & 1u) == 0 || (ahb >> 31) != 0) {
++		printf("SWEET GPUCC: gcc_gpu_cfg_ahb_clk is off, gpucc NOT touched\n");
++		return;
++	}
++
++	vm_offset_t cc = ml_io_map(GC_CC_PA, GC_CC_LEN);
++	if (!cc) {
++		printf("SWEET GPUCC: gpucc map failed\n");
++		return;
++	}
++	uint32_t cx = gc_rd(cc, GC_CX_GDSCR);
++	uint32_t gx = gc_rd(cc, GC_GX_GDSCR);
++	uint32_t hw = gc_rd(cc, GC_CX_HW_CTRL);
++	printf("SWEET GPUCC: cx_gdscr=%#x sw_collapse=%u pwr_on=%u\n",
++		cx, cx & 1u, cx >> 31);
++	printf("SWEET GPUCC: gx_gdscr=%#x sw_collapse=%u pwr_on=%u\n",
++		gx, gx & 1u, gx >> 31);
++	printf("SWEET GPUCC: cx_hw_ctrl=%#x\n", hw);
++	gc_rcg(cc, "gmu", GC_GMU_RCG);
++	gc_rcg(cc, "gfx3d", GC_GFX3D_RCG);
++	printf("SWEET GPUCC: gpu_cc_pll0 mode=%#x pll1 mode=%#x\n",
++		gc_rd(cc, GC_PLL0), gc_rd(cc, GC_PLL1));
++	for (unsigned i = 0; i < sizeof(gc_cbcr) / sizeof(gc_cbcr[0]); ++i) {
++		uint32_t v = gc_rd(cc, gc_cbcr[i].off);
++		printf("SWEET GPUCC: cbcr %s [%#x] = %#x clk_off=%u en=%u\n",
++			gc_cbcr[i].name, gc_cbcr[i].off, v, v >> 31, v & 1u);
++	}
++	printf("SWEET GPUCC: done\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,2 +56,3 @@ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_probe(void);
++extern void sweet_gpu_cc_probe(void);
+ 
+@@ -664,2 +665,3 @@ extern void sweet_gpu_probe(void);
+ 	sweet_gpu_probe();
++	sweet_gpu_cc_probe();
+ 	return 0;
