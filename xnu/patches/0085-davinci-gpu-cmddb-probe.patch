@@ -1,0 +1,146 @@
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_probe.c
+@@ -0,0 +1,143 @@
++/*
++ * SWEET/davinci GPU bring-up, stage 1: READ-ONLY cmd-db inventory.
++ * Lists every RPMh resource (name, address, aux size) and dumps the ARC level
++ * tables of cx/mx/gfx so patch 0086 can vote real levels instead of guessing.
++ * No RSC/TCS access, no votes, no GPU/GMU/GPUCC register access.
++ * Layout mirrors sweet_rpmh.c (header 144 B, slave hdr 16 B, entry 24 B).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_probe(void);
++
++#define GP_DICT_PA   0x0c3f000cu
++#define GP_DB_MAGIC  0x0c0330dbu
++#define GP_DB_HEADER 144u
++#define GP_DB_ENTRY  24u
++#define GP_DB_MAX    0x100000u
++
++static vm_offset_t gp_db;
++static uint32_t gp_size;
++static bool gp_done;
++
++static uint32_t
++gp_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static uint16_t
++gp_rd16(uint32_t off)
++{
++	return (uint16_t)(gp_rd(gp_db, off & ~3u) >> (8u * (off & 3u)));
++}
++
++static bool
++gp_range(uint32_t off, uint32_t len)
++{
++	return off <= gp_size && len <= gp_size - off;
++}
++
++static void
++gp_name(uint32_t e, char out[9])
++{
++	uint32_t w[2] = { gp_rd(gp_db, e), gp_rd(gp_db, e + 4) };
++	for (unsigned i = 0; i < 8; ++i) {
++		char c = (char)(w[i / 4] >> (8u * (i % 4)));
++		out[i] = (c >= 0x20 && c < 0x7f) ? c : (c ? '?' : '\0');
++	}
++	out[8] = '\0';
++}
++
++static bool
++gp_interesting(const char *n)
++{
++	return !strncmp(n, "cx", 2) || !strncmp(n, "mx", 2) ||
++	       !strncmp(n, "gfx", 3) || !strncmp(n, "gmx", 3);
++}
++
++void
++sweet_gpu_probe(void)
++{
++	if (gp_done) {
++		return;
++	}
++	gp_done = true;
++	vm_offset_t dict = ml_io_map(GP_DICT_PA, 8);
++	if (!dict) {
++		printf("SWEET GPUDB: locator map failed\n");
++		return;
++	}
++	uint32_t pa = gp_rd(dict, 0), size = gp_rd(dict, 4);
++	if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
++	    size < GP_DB_HEADER || size > GP_DB_MAX ||
++	    (uint64_t)pa + size > 0x100000000ULL) {
++		printf("SWEET GPUDB: bad locator pa=%#x size=%#x\n", pa, size);
++		return;
++	}
++	gp_db = ml_io_map(pa, size);
++	if (!gp_db) {
++		printf("SWEET GPUDB: db map failed\n");
++		return;
++	}
++	gp_size = size;
++	if (gp_rd(gp_db, 4) != GP_DB_MAGIC) {
++		printf("SWEET GPUDB: bad magic %#x\n", gp_rd(gp_db, 4));
++		return;
++	}
++	unsigned total = 0, found_cx = 0, found_mx = 0, found_gfx = 0;
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = gp_rd16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = GP_DB_HEADER + gp_rd16(h + 2);
++		uint32_t aux = GP_DB_HEADER + gp_rd16(h + 4);
++		unsigned count = gp_rd16(h + 6);
++		printf("SWEET GPUDB: slave=%u count=%u aux-version=%#x\n",
++		    slave, count, gp_rd16(h + 8));
++		if ((entries & 3u) || !gp_range(entries, count * GP_DB_ENTRY)) {
++			printf("SWEET GPUDB: malformed slave header %u\n", i);
++			return;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + GP_DB_ENTRY * j;
++			char name[9];
++			gp_name(e, name);
++			uint32_t addr = gp_rd(gp_db, e + 16);
++			unsigned auxlen = gp_rd16(e + 20);
++			uint32_t auxoff = aux + gp_rd16(e + 22);
++			bool star = gp_interesting(name);
++			++total;
++			if (!strcmp(name, "cx.lvl")) {
++				++found_cx;
++			} else if (!strcmp(name, "mx.lvl")) {
++				++found_mx;
++			} else if (!strcmp(name, "gfx.lvl")) {
++				++found_gfx;
++			}
++			printf("SWEET GPUDB:%s s=%u %s addr=%#x aux=%u\n",
++			    star ? "*" : " ", slave, name, addr, auxlen);
++			/* ARC level tables: u16 vlvl values, print the first 16. */
++			if (star && slave == 3 && auxlen && gp_range(auxoff, auxlen)) {
++				char buf[128];
++				size_t n = 0;
++				for (unsigned k = 0; k < auxlen / 2 && k < 16 &&
++				    n < sizeof(buf) - 8; ++k) {
++					n += snprintf(buf + n, sizeof(buf) - n, "%#x ",
++					    gp_rd16(auxoff + 2u * k));
++				}
++				printf("SWEET GPUDB:   %s levels: %s\n", name, buf);
++			}
++		}
++	}
++	printf("SWEET GPUDB: total=%u cx.lvl=%u mx.lvl=%u gfx.lvl=%u\n",
++	    total, found_cx, found_mx, found_gfx);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
