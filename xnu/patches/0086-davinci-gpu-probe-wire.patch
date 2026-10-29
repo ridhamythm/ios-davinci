@@ -1,0 +1,51 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/sweet_rpmh.c                   standard
+ bsd/dev/sweet_spmi.c                   standard
+ bsd/dev/sweet_usb.c                    standard
++bsd/dev/sweet_gpu_probe.c              standard
+ bsd/dev/mem.c                          standard
+ bsd/dev/munge.c                        optional config_requires_u32_munging
+ bsd/dev/unix_startup.c                 standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -659,6 +660,7 @@
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_probe();
+ 	return 0;
+ }
+--- a/bsd/dev/sweet_gpu_probe.c
++++ b/bsd/dev/sweet_gpu_probe.c
+@@ -9,5 +9,6 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -65,6 +66,13 @@
+ void
+ sweet_gpu_probe(void)
+ {
++	int enabled = 0;
++
++	PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++
+ 	if (gp_done) {
+ 		return;
+ 	}
