@@ -1,0 +1,145 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,2 +115,3 @@ bsd/dev/sweet_gpu_probe.c			standard
+ bsd/dev/sweet_gpu_cc.c			standard
++bsd/dev/sweet_gpu_cx.c			standard
+ bsd/dev/mem.c				standard
+--- a/bsd/dev/sweet_gpu_cc.c
++++ b/bsd/dev/sweet_gpu_cc.c
+@@ -15,2 +15,3 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_gpu_cc_probe(void);
++void sweet_gpu_cx_enable(vm_offset_t, vm_offset_t, uint32_t);
+ 
+@@ -77,3 +78,3 @@ sweet_gpu_cc_probe(void)
+ 	PE_parse_boot_argn("sweetgpucc", &enabled, sizeof(enabled));
+-	if (enabled != 1) {
++	if (enabled < 1 || enabled > 3) {
+ 		return;
+@@ -122,2 +123,5 @@ sweet_gpu_cc_probe(void)
+ 	}
++	if (enabled >= 2) {
++		sweet_gpu_cx_enable(gcc, cc, enabled);
++	}
+ 	printf("SWEET GPUCC: done\n");
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_cx.c
+@@ -0,0 +1,119 @@
++/*
++ * SWEET/davinci GPU bring-up, stage 3: FIRST WRITES, staged by sweetgpucc.
++ * level 2: power up the GPU CX GDSC only (clear SW_COLLAPSE, wait PWR_ON).
++ * level 3: level 2, then gmu_clk_src -> TCXO and open cxo/ahb/cx_gmu CBCRs.
++ * Every wait is bounded; on a timeout the step is undone and the rest is
++ * skipped. GX, GMU, GPLL0 and RPMh votes are NOT touched here.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++
++void sweet_gpu_cx_enable(vm_offset_t gcc, vm_offset_t cc, uint32_t level);
++
++#define GX_GPU_CFG_AHB   0x71004u
++#define GX_CX_GDSCR      0x106cu
++#define GX_GMU_RCG       0x1120u
++#define GX_CBCR_AHB      0x1078u
++#define GX_CBCR_CX_GMU   0x1098u
++#define GX_CBCR_CXO      0x109cu
++#define GX_POLL          200000u
++
++static uint32_t
++gx_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gx_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++gx_cx_power(vm_offset_t cc)
++{
++	uint32_t v = gx_rd(cc, GX_CX_GDSCR);
++
++	if ((v & 1u) == 0 && (v >> 31) != 0) {
++		return true;
++	}
++	gx_wr(cc, GX_CX_GDSCR, v & ~1u);
++	for (uint32_t i = 0; i < GX_POLL; ++i) {
++		if ((gx_rd(cc, GX_CX_GDSCR) >> 31) != 0) {
++			return true;
++		}
++	}
++	gx_wr(cc, GX_CX_GDSCR, v | 1u);
++	return false;
++}
++
++static bool
++gx_gmu_rcg_tcxo(vm_offset_t cc)
++{
++	/* parent_map_0: P_BI_TCXO = 0; cfg = src 0, no divider (19.2 MHz). */
++	gx_wr(cc, GX_GMU_RCG + 4u, 0);
++	gx_wr(cc, GX_GMU_RCG, gx_rd(cc, GX_GMU_RCG) | 1u);
++	for (uint32_t i = 0; i < GX_POLL; ++i) {
++		if ((gx_rd(cc, GX_GMU_RCG) & 1u) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++gx_cbcr_on(vm_offset_t cc, uint32_t off, uint32_t extra)
++{
++	uint32_t v = gx_rd(cc, off);
++
++	gx_wr(cc, off, v | extra | 1u);
++	for (uint32_t i = 0; i < GX_POLL; ++i) {
++		if ((gx_rd(cc, off) >> 31) == 0) {
++			return true;
++		}
++	}
++	gx_wr(cc, off, v);
++	return false;
++}
++
++static void
++gx_dump(vm_offset_t cc)
++{
++	printf("SWEET GPUCX: cx_gdscr=%#x rcg gmu cmd=%#x cfg=%#x\n",
++		gx_rd(cc, GX_CX_GDSCR), gx_rd(cc, GX_GMU_RCG), gx_rd(cc, GX_GMU_RCG + 4u));
++	printf("SWEET GPUCX: cbcr ahb=%#x cx_gmu=%#x cxo=%#x\n",
++		gx_rd(cc, GX_CBCR_AHB), gx_rd(cc, GX_CBCR_CX_GMU), gx_rd(cc, GX_CBCR_CXO));
++}
++
++void
++sweet_gpu_cx_enable(vm_offset_t gcc, vm_offset_t cc, uint32_t level)
++{
++	uint32_t ahb = gx_rd(gcc, GX_GPU_CFG_AHB);
++
++	if ((ahb & 1u) == 0 || (ahb >> 31) != 0) {
++		printf("SWEET GPUCX: gpu_cfg_ahb not on, no writes\n");
++		return;
++	}
++	printf("SWEET GPUCX: level %u: enabling CX GDSC\n", level);
++	bool ok = gx_cx_power(cc);
++	printf("SWEET GPUCX: CX GDSC %s\n", ok ? "on" : "TIMEOUT, reverted");
++	if (!ok || level < 3) {
++		gx_dump(cc);
++		return;
++	}
++	printf("SWEET GPUCX: gmu_clk_src -> TCXO %s\n",
++		gx_gmu_rcg_tcxo(cc) ? "ok" : "TIMEOUT");
++	printf("SWEET GPUCX: cxo %s\n", gx_cbcr_on(cc, GX_CBCR_CXO, 0) ? "on" : "TIMEOUT");
++	printf("SWEET GPUCX: ahb %s\n", gx_cbcr_on(cc, GX_CBCR_AHB, 0) ? "on" : "TIMEOUT");
++	/* recommended wake/sleep settings for cx_gmu: 0xf << 8 | 0xf << 4 */
++	printf("SWEET GPUCX: cx_gmu %s\n",
++		gx_cbcr_on(cc, GX_CBCR_CX_GMU, 0xff0u) ? "on" : "TIMEOUT");
++	gx_dump(cc);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
