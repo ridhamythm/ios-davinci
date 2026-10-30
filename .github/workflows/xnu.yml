@@ -67,6 +67,22 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      - name: Archive Xcode 15 iig (macOS 15 migration)
+        run: |
+          IIG=$(xcrun --find iig)
+          echo "iig: $IIG"
+          mkdir -p iig-pack
+          cp "$IIG" iig-pack/
+          otool -L "$IIG" | tee iig-pack/otool.txt
+          xcodebuild -version | tee iig-pack/xcode.txt
+          du -sh "$DEVELOPER_DIR/Platforms/DriverKit.platform" | tee iig-pack/driverkit-size.txt || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcode15-iig
+          path: iig-pack
+          retention-days: 90
+
       - name: Build
         working-directory: dxb
         env:
