@@ -1,0 +1,140 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,2 +116,3 @@ bsd/dev/sweet_gpu_cc.c			standard
+ bsd/dev/sweet_gpu_cx.c			standard
++bsd/dev/sweet_gpu_gmu.c			standard
+ bsd/dev/mem.c				standard
+--- a/bsd/dev/sweet_gpu_cc.c
++++ b/bsd/dev/sweet_gpu_cc.c
+@@ -78,3 +78,3 @@ sweet_gpu_cc_probe(void)
+ 	PE_parse_boot_argn("sweetgpucc", &enabled, sizeof(enabled));
+-	if (enabled < 1 || enabled > 3) {
++	if (enabled < 1 || enabled > 5) {
+ 		return;
+--- a/bsd/dev/sweet_gpu_cx.c
++++ b/bsd/dev/sweet_gpu_cx.c
+@@ -13,2 +13,3 @@
+ void sweet_gpu_cx_enable(vm_offset_t gcc, vm_offset_t cc, uint32_t level);
++void sweet_gpu_gmu_probe(vm_offset_t cc, uint32_t level);
+ 
+@@ -117,2 +118,5 @@ sweet_gpu_cx_enable(vm_offset_t gcc, vm_offset_t cc, uint32_t level)
+ 	gx_dump(cc);
++	if (level >= 4) {
++		sweet_gpu_gmu_probe(cc, level);
++	}
+ }
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_gmu.c
+@@ -0,0 +1,112 @@
++/*
++ * SWEET/davinci GPU bring-up, stage 4: READ-ONLY GMU registers.
++ * sweetgpucc=4: GMU CX registers (CM3 reset/firmware state, HFI, counter).
++ * sweetgpucc=5: also the always-on (AO) block.
++ * Runs only after 0088 level 3 and re-checks that CX, cx_gmu and cxo are on.
++ * Every read is announced first and the log gets time to flush, so a bus
++ * hang still leaves the last register name in the persistent log.
++ * Offsets: kgsl a6xx_reg.h dword offset (GPU-relative) -> (reg - 0x1a800) * 4.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_gmu_probe(vm_offset_t cc, uint32_t level);
++
++#define GM_PA            0x0506a000u
++#define GM_LEN           0x00031000u
++#define GM_CX_GDSCR      0x106cu
++#define GM_CBCR_CX_GMU   0x1098u
++#define GM_CBCR_CXO      0x109cu
++#define GM_COUNTER_L     0x14220u
++#define GM_FLUSH_MS      1200u
++
++struct gm_reg {
++	const char *name;
++	uint32_t off;
++};
++
++static const struct gm_reg gm_cx[] = {
++	{ "CM3_SYSRESET", 0x14000 },
++	{ "CX_GMU_WFI_CONFIG", 0x14008 },
++	{ "CM3_FW_INIT_RESULT", 0x14070 },
++	{ "CM3_CFG", 0x140b4 },
++	{ "PWR_COL_KEEPALIVE", 0x1430c },
++	{ "HFI_CTRL_STATUS", 0x14600 },
++	{ "GMU2HOST_INTR_INFO", 0x14648 },
++	{ "GMU2HOST_INTR_MASK", 0x1464c },
++	{ "GENERAL_0", 0x14714 },
++};
++
++static const struct gm_reg gm_ao[] = {
++	{ "AO_HOST_INTERRUPT_STATUS", 0x24c14 },
++	{ "AO_AHB_FENCE_CTRL", 0x24c40 },
++	{ "AHB_FENCE_STATUS", 0x24c4c },
++};
++
++static uint32_t
++gm_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gm_wait_ms(uint32_t ms)
++{
++	uint64_t freq, t0, t;
++
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
++	__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (t0));
++	uint64_t ticks = (freq / 1000u) * ms;
++	do {
++		__asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (t));
++	} while (t - t0 < ticks);
++}
++
++static uint32_t
++gm_peek(vm_offset_t gmu, const char *name, uint32_t off)
++{
++	printf("SWEET GPUGMU: reading %s [%#x]\n", name, off);
++	gm_wait_ms(GM_FLUSH_MS);
++	uint32_t v = gm_rd(gmu, off);
++	printf("SWEET GPUGMU: %s = %#x\n", name, v);
++	return v;
++}
++
++void
++sweet_gpu_gmu_probe(vm_offset_t cc, uint32_t level)
++{
++	uint32_t gd = gm_rd(cc, GM_CX_GDSCR);
++	uint32_t gc = gm_rd(cc, GM_CBCR_CX_GMU);
++	uint32_t cxo = gm_rd(cc, GM_CBCR_CXO);
++
++	if ((gd >> 31) == 0 || (gc >> 31) != 0 || (cxo >> 31) != 0) {
++		printf("SWEET GPUGMU: CX/cx_gmu/cxo not on (%#x %#x %#x), no reads\n",
++			gd, gc, cxo);
++		return;
++	}
++	vm_offset_t gmu = ml_io_map(GM_PA, GM_LEN);
++	if (!gmu) {
++		printf("SWEET GPUGMU: map failed\n");
++		return;
++	}
++	printf("SWEET GPUGMU: level %u: reading GMU registers\n", level);
++	uint32_t c0 = gm_peek(gmu, "ALWAYS_ON_COUNTER_L", GM_COUNTER_L);
++	uint32_t c1 = gm_peek(gmu, "ALWAYS_ON_COUNTER_L", GM_COUNTER_L);
++	printf("SWEET GPUGMU: always-on counter %s (%#x -> %#x)\n",
++		c1 != c0 ? "ticking" : "STUCK", c0, c1);
++	for (unsigned i = 0; i < sizeof(gm_cx) / sizeof(gm_cx[0]); ++i) {
++		gm_peek(gmu, gm_cx[i].name, gm_cx[i].off);
++	}
++	if (level >= 5) {
++		for (unsigned i = 0; i < sizeof(gm_ao) / sizeof(gm_ao[0]); ++i) {
++			gm_peek(gmu, gm_ao[i].name, gm_ao[i].off);
++		}
++	}
++	printf("SWEET GPUGMU: done\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
