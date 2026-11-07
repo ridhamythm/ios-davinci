@@ -1,0 +1,62 @@
+--- a/bsd/dev/sweet_gpu_cc.c
++++ b/bsd/dev/sweet_gpu_cc.c
+@@ -78,3 +78,3 @@ sweet_gpu_cc_probe(void)
+ 	PE_parse_boot_argn("sweetgpucc", &enabled, sizeof(enabled));
+-	if (enabled < 1 || enabled > 8) {
++	if (enabled < 1 || enabled > 10) {
+ 		return;
+--- a/bsd/dev/sweet_gpu_gmu.c
++++ b/bsd/dev/sweet_gpu_gmu.c
+@@ -79,2 +79,46 @@ gm_peek(vm_offset_t gmu, const char *name, uint32_t off)
+ 
++#define GM_ITCM          0x3000u
++#define GM_DTCM          0x7000u
++#define GM_TCM_SIZE      0x4000u
++#define GM_SYSRESET      0x14000u
++#define GM_TCM_PAT       0xa5c3e1f0u
++
++static void
++gm_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++gm_tcm(vm_offset_t gmu, uint32_t level)
++{
++	uint32_t sr = gm_rd(gmu, GM_SYSRESET);
++
++	if (sr != 1u) {
++		printf("SWEET GPUTCM: CM3_SYSRESET=%#x (not in reset), TCM untouched\n", sr);
++		return;
++	}
++	printf("SWEET GPUTCM: level %u: ITCM=%#x DTCM=%#x\n", level, GM_ITCM, GM_DTCM);
++	gm_peek(gmu, "ITCM[0]", GM_ITCM);
++	gm_peek(gmu, "ITCM[1]", GM_ITCM + 4u);
++	gm_peek(gmu, "ITCM[last]", GM_ITCM + GM_TCM_SIZE - 4u);
++	gm_peek(gmu, "DTCM[0]", GM_DTCM);
++	gm_peek(gmu, "DTCM[last]", GM_DTCM + GM_TCM_SIZE - 4u);
++	if (level < 10) {
++		return;
++	}
++	uint32_t off = GM_ITCM + GM_TCM_SIZE - 4u;
++	uint32_t orig = gm_peek(gmu, "ITCM[last] orig", off);
++	printf("SWEET GPUTCM: writing %#x to ITCM[last]\n", GM_TCM_PAT);
++	gm_wait_ms(GM_FLUSH_MS);
++	gm_wr(gmu, off, GM_TCM_PAT);
++	uint32_t rb = gm_rd(gmu, off);
++	gm_wr(gmu, off, orig);
++	uint32_t rb2 = gm_rd(gmu, off);
++	printf("SWEET GPUTCM: readback=%#x %s; restored=%#x %s\n",
++		rb, rb == GM_TCM_PAT ? "MATCH" : "MISMATCH",
++		rb2, rb2 == orig ? "ok" : "DIFFERS");
++}
++
+ void
+@@ -109,2 +153,5 @@ sweet_gpu_gmu_probe(vm_offset_t cc, uint32_t level)
+ 	}
++	if (level >= 9) {
++		gm_tcm(gmu, level);
++	}
+ 	printf("SWEET GPUGMU: done\n");
