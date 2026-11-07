@@ -1,0 +1,68 @@
+--- a/bsd/dev/sweet_gpu_cc.c
++++ b/bsd/dev/sweet_gpu_cc.c
+@@ -78,3 +78,3 @@ sweet_gpu_cc_probe(void)
+ 	PE_parse_boot_argn("sweetgpucc", &enabled, sizeof(enabled));
+-	if (enabled < 1 || enabled > 7) {
++	if (enabled < 1 || enabled > 8) {
+ 		return;
+--- a/bsd/dev/sweet_gpu_cx.c
++++ b/bsd/dev/sweet_gpu_cx.c
+@@ -95,2 +95,51 @@ gx_dump(vm_offset_t cc)
+ 
++#define GX_GCC_GPLL0     0x0u
++#define GX_GCC_VOTE0     0x52000u
++#define GX_GCC_VOTE1     0x52004u
++#define GX_VOTE_GPLL0    (1u << 0)
++#define GX_VOTE_DIV      (1u << 16)
++#define GX_GMU_CFG_200   ((6u << 8) | 2u)
++
++static bool
++gx_rcg_set(vm_offset_t cc, uint32_t cfg)
++{
++	gx_wr(cc, GX_GMU_RCG + 4u, cfg);
++	gx_wr(cc, GX_GMU_RCG, gx_rd(cc, GX_GMU_RCG) | 1u);
++	for (uint32_t i = 0; i < GX_POLL; ++i) {
++		if ((gx_rd(cc, GX_GMU_RCG) & 1u) == 0) {
++			return (gx_rd(cc, GX_GMU_RCG) >> 31) == 0;
++		}
++	}
++	return false;
++}
++
++static void
++gx_gmu_200(vm_offset_t gcc, vm_offset_t cc)
++{
++	uint32_t pll = gx_rd(gcc, GX_GCC_GPLL0);
++	uint32_t v0 = gx_rd(gcc, GX_GCC_VOTE0);
++	uint32_t v1 = gx_rd(gcc, GX_GCC_VOTE1);
++
++	printf("SWEET GPUPLL: gpll0 mode=%#x L?=%#x vote0=%#x vote1=%#x\n",
++		pll, gx_rd(gcc, GX_GCC_GPLL0 + 4u), v0, v1);
++	if ((pll >> 31) == 0 || (pll & 1u) == 0) {
++		printf("SWEET GPUPLL: gpll0 not locked/enabled, no changes\n");
++		return;
++	}
++	gx_wr(gcc, GX_GCC_VOTE0, v0 | GX_VOTE_GPLL0);
++	gx_wr(gcc, GX_GCC_VOTE1, v1 | GX_VOTE_DIV);
++	printf("SWEET GPUPLL: voted: gpll0 mode=%#x vote0=%#x vote1=%#x\n",
++		gx_rd(gcc, GX_GCC_GPLL0), gx_rd(gcc, GX_GCC_VOTE0), gx_rd(gcc, GX_GCC_VOTE1));
++	bool ok = gx_rcg_set(cc, GX_GMU_CFG_200);
++	uint32_t cg = gx_rd(cc, GX_CBCR_CX_GMU);
++	if (ok && (cg >> 31) == 0) {
++		printf("SWEET GPUPLL: gmu_clk_src -> GPLL0 DIV/1.5 ok (cx_gmu=%#x)\n", cg);
++		return;
++	}
++	printf("SWEET GPUPLL: switch FAILED (ok=%d cx_gmu=%#x), reverting to TCXO\n", ok, cg);
++	printf("SWEET GPUPLL: revert %s\n", gx_rcg_set(cc, 0) ? "ok" : "TIMEOUT");
++	gx_wr(gcc, GX_GCC_VOTE1, v1);
++	gx_wr(gcc, GX_GCC_VOTE0, v0);
++}
++
+ static void
+@@ -136,2 +185,6 @@ sweet_gpu_cx_enable(vm_offset_t gcc, vm_offset_t cc, uint32_t level)
+ 	}
++	if (level >= 8) {
++		gx_gmu_200(gcc, cc);
++		gx_dump(cc);
++	}
+ 	if (level >= 4) {
