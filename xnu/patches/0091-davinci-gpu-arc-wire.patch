@@ -1,0 +1,36 @@
+--- a/bsd/dev/sweet_gpu_cc.c
++++ b/bsd/dev/sweet_gpu_cc.c
+@@ -78,3 +78,3 @@ sweet_gpu_cc_probe(void)
+ 	PE_parse_boot_argn("sweetgpucc", &enabled, sizeof(enabled));
+-	if (enabled < 1 || enabled > 5) {
++	if (enabled < 1 || enabled > 7) {
+ 		return;
+--- a/bsd/dev/sweet_gpu_cx.c
++++ b/bsd/dev/sweet_gpu_cx.c
+@@ -14,2 +14,3 @@ void sweet_gpu_cx_enable(vm_offset_t gcc, vm_offset_t cc, uint32_t level);
+ void sweet_gpu_gmu_probe(vm_offset_t cc, uint32_t level);
++int sweet_rpmh_arc_vote(const char *res, unsigned level);
+ 
+@@ -94,2 +95,11 @@ gx_dump(vm_offset_t cc)
+ 
++static void
++gx_arc(const char *res, unsigned lvl)
++{
++	printf("SWEET GPUARC: voting %s level %#x\n", res, lvl);
++	int err = sweet_rpmh_arc_vote(res, lvl);
++	printf("SWEET GPUARC: %s %#x -> errno %d (%s)\n", res, lvl, err,
++		err ? "FAILED" : "ok");
++}
++
+ void
+@@ -118,2 +128,10 @@ sweet_gpu_cx_enable(vm_offset_t gcc, vm_offset_t cc, uint32_t level)
+ 	gx_dump(cc);
++	if (level >= 6) {
++		/* ARC votes (RPMh ACTIVE TCS): cx.lvl first, gfx.lvl only at 7. */
++		gx_arc("cx.lvl", 0x40);
++		if (level >= 7) {
++			gx_arc("gfx.lvl", 0x40);
++		}
++		gx_dump(cc);
++	}
+ 	if (level >= 4) {
