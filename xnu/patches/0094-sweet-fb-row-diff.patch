@@ -1,0 +1,52 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -107,2 +107,4 @@ public:
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
++	uint8_t      *fShadow;          /* copy of what the panel shows (row diff) */
++	bool          fShadowValid;
+ 	IOMemoryMap  *fMap;
+@@ -234,2 +236,3 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (step <= 6) {
++			fb->fShadowValid = false;
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+@@ -326,2 +329,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 
++	static bool shadow_tried;
++	static uint64_t rows_copied, rows_skipped, presents;
++	size_t shadow_size = (size_t)fRowBytes * fHeight;
++
++	if (fShadow == NULL && !shadow_tried) {
++		shadow_tried = true;
++		fShadow = (uint8_t *)IOMallocData(shadow_size);
++		IOLog("SWEET FB: row-diff shadow %s (%lu bytes)\n",
++			fShadow ? "ok" : "alloc FAILED", (unsigned long)shadow_size);
++	}
++	if (fShadow != NULL && !fShadowValid) {
++		memcpy(fShadow, (const void *)fPixels, shadow_size);
++		fShadowValid = true;
++	}
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+@@ -394,5 +411,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++				uint64_t poff = (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4;
++				const void *from = (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++				if (fShadow != NULL && fShadowValid) {
++					if (memcmp(fShadow + poff, from, (size_t)w * 4) == 0) {
++						rows_skipped++;
++						continue;
++					}
++					memcpy(fShadow + poff, from, (size_t)w * 4);
++				}
++				memcpy((void *)(fPixels + poff), from, (size_t)w * 4);
++				rows_copied++;
+ 			}
+@@ -401,2 +426,6 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
++	if ((++presents % 300) == 0) {
++		IOLog("SWEET FB: present %llu rows copied %llu skipped %llu\n",
++			presents, rows_copied, rows_skipped);
++	}
+ }
